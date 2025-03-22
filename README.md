@@ -1,5 +1,6 @@
 # CockroachDB MCP Server
 
+[![smithery badge](https://smithery.ai/badge/@Swayingleaves/cockroachdb-mcp-server)](https://smithery.ai/server/@Swayingleaves/cockroachdb-mcp-server)
 [English](README.md) | [简体中文](README_zh.md)
 
 This is a CockroachDB MCP server for Cursor, implemented based on the Model Context Protocol (MCP) specification, allowing you to interact directly with CockroachDB database in Cursor.
@@ -19,6 +20,14 @@ This is a CockroachDB MCP server for Cursor, implemented based on the Model Cont
 - Support manual disconnection
 
 ## Installation
+
+### Installing via Smithery
+
+To install CockroachDB MCP Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@Swayingleaves/cockroachdb-mcp-server):
+
+```bash
+npx -y @smithery/cli install @Swayingleaves/cockroachdb-mcp-server --client claude
+```
 
 1. Clone the repository and enter the project directory
 2. Install dependencies:
