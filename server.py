@@ -10,66 +10,67 @@ import signal
 from typing import Dict, List, Any
 from mcp.server.fastmcp import FastMCP
 
-# 创建logs目录（如果不存在）
+# Create logs directory (if it doesn't exist)
 os.makedirs('logs', exist_ok=True)
 
-# 配置日志
+# Configure logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # 设置为DEBUG级别以获取更多信息
+logger.setLevel(logging.DEBUG)  # Set to DEBUG level for more information
 
-# 创建一个RotatingFileHandler，每个日志文件最大10MB，最多保留5个备份
+# Create a RotatingFileHandler, max 10MB per log file, keep up to 5 backups
 file_handler = RotatingFileHandler('logs/cockroachdb_mcp.log', maxBytes=10*1024*1024, backupCount=5)
 file_handler.setLevel(logging.DEBUG)
 
-# 创建一个格式化器
+# Create a formatter
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 
-# 将处理器添加到日志记录器
+# Add handler to the logger
 logger.addHandler(file_handler)
 
-# 添加控制台日志处理器，方便调试
+# Add console log handler for easy debugging
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.DEBUG)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# 全局变量
+# Global variables
 db_connection = None
-last_connect_params = None  # 存储最后一次使用的连接参数
+last_connect_params = None  # Store the last used connection parameters
 
 def signal_handler(sig, frame):
-    """处理进程信号，确保优雅退出"""
-    logger.info(f"收到信号 {sig}，准备退出")
+    """Handle process signals to ensure graceful exit"""
+    logger.info(f"Received signal {sig}, preparing to exit")
     global db_connection
     
-    # 关闭数据库连接
+    # Close database connection
     if db_connection:
         try:
             db_connection.close()
-            logger.info("数据库连接已关闭")
+            logger.info("Database connection closed")
         except Exception as e:
-            logger.error(f"关闭数据库连接时出错: {str(e)}")
+            logger.error(f"Error closing database connection: {str(e)}")
     
     sys.exit(0)
 
-# 注册信号处理器
+# Register signal handlers
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# 初始化FastMCP服务器
+# Initialize FastMCP server
 mcp = FastMCP(
     "cockroachdb-mcp",
-    description="CockroachDB MCP 服务器，用于在 Cursor 中直接与 CockroachDB 数据库交互",
+    description="CockroachDB MCP server for interacting directly with CockroachDB database in Cursor",
     version="1.0.0"
 )
 
 def parse_jdbc_url(jdbc_url):
-    """解析JDBC URL并返回连接参数"""
-    # 格式: jdbc:postgresql://host:port/database?param1=value1&param2=value2
+    """Parse JDBC URL and return connection parameters"""
+    # Format: jdbc:postgresql://username:password@host:port/database?param1=value1&param2=value2
+    # Or: postgresql://username:password@host:port/database?param1=value1&param2=value2
     jdbc_url = jdbc_url.replace("jdbc:", "")
     
-    # 分离查询参数
+    # Separate query parameters
     url_parts = jdbc_url.split("?")
     base_url = url_parts[0]
     query_params = {}
@@ -80,19 +81,34 @@ def parse_jdbc_url(jdbc_url):
                 key, value = param.split("=", 1)
                 query_params[key] = value
     
-    # 解析基本URL部分
+    # Parse base URL part
     base_url = base_url.replace("postgresql://", "")
-    host_port_db = base_url.split("/")
-    host_port = host_port_db[0].split(":")
-    host = host_port[0]
-    port = int(host_port[1]) if len(host_port) > 1 else 26257
+    
+    # Handle potential authentication information
+    if "@" in base_url:
+        # Separate authentication info and host info
+        auth_host = base_url.split("@", 1)
+        host_port_db = auth_host[1].split("/")
+    else:
+        host_port_db = base_url.split("/")
+    
+    # Parse host and port
+    if ":" in host_port_db[0]:
+        host_port = host_port_db[0].split(":")
+        host = host_port[0]
+        port = int(host_port[1]) if len(host_port) > 1 else 26257
+    else:
+        host = host_port_db[0]
+        port = 26257
+    
+    # Parse database name
     database = host_port_db[1] if len(host_port_db) > 1 else "defaultdb"
     
     return host, port, database, query_params
 
 def create_connection(host, port, database, username, password, query_params):
-    """创建数据库连接"""
-    # 构建连接参数
+    """Create database connection"""
+    # Build connection parameters
     connect_params = {
         "host": host,
         "port": port,
@@ -101,115 +117,115 @@ def create_connection(host, port, database, username, password, query_params):
         "database": database,
         "sslmode": "require",
         "application_name": "cockroachdb-mcp",
-        "keepalives": 1,              # 启用TCP keepalive
-        "keepalives_idle": 30,        # 空闲30秒后发送keepalive
-        "keepalives_interval": 10,    # 每10秒发送一次keepalive
-        "keepalives_count": 5         # 5次尝试后放弃
+        "keepalives": 1,              # Enable TCP keepalive
+        "keepalives_idle": 30,        # Send keepalive after 30 seconds of idle time
+        "keepalives_interval": 10,    # Send keepalive every 10 seconds
+        "keepalives_count": 5         # Give up after 5 attempts
     }
     
-    # 添加查询参数
+    # Add query parameters
     if "TimeZone" in query_params:
         connect_params["options"] = f"-c timezone={query_params['TimeZone']}"
     
-    # 使用psycopg2直接连接
-    logger.info(f"连接参数: {json.dumps({k: v for k, v in connect_params.items() if k != 'password'})}")
+    # Connect directly using psycopg2
+    logger.info(f"Connection parameters: {json.dumps({k: v for k, v in connect_params.items() if k != 'password'})}")
     
-    # 创建连接
+    # Create connection
     conn = psycopg2.connect(**connect_params)
-    conn.set_session(autocommit=True)  # 设置自动提交
+    conn.set_session(autocommit=True)  # Set autocommit
     return conn, connect_params
 
 @mcp.tool()
 async def connect_database(jdbc_url: str, username: str, password: str) -> str:
-    """连接到CockroachDB数据库。
+    """Connect to CockroachDB database.
     
     Args:
-        jdbc_url: JDBC连接URL (例如: jdbc:postgresql://localhost:26257/defaultdb)
-        username: 数据库用户名
-        password: 数据库密码
+        jdbc_url: JDBC connection URL (e.g., jdbc:postgresql://localhost:26257/defaultdb)
+        username: Database username
+        password: Database password
     """
     global db_connection, last_connect_params
     try:
-        logger.info(f"尝试连接数据库: {jdbc_url}")
+        logger.info(f"Attempting to connect to database: {jdbc_url}")
         
-        # 解析JDBC URL
+        # Parse JDBC URL
         host, port, database, query_params = parse_jdbc_url(jdbc_url)
         
-        # 如果已有连接，先关闭
+        # If connection exists, close it first
         if db_connection:
             try:
                 db_connection.close()
             except:
                 pass
         
-        # 创建新连接
+        # Create new connection
         db_connection, last_connect_params = create_connection(host, port, database, username, password, query_params)
         
-        # 测试连接
+        # Test connection
         with db_connection.cursor() as cursor:
             cursor.execute("SELECT 1")
             cursor.fetchone()
         
-        logger.info("数据库连接成功")
-        return "数据库连接成功"
+        logger.info("Database connection successful")
+        return "Database connection successful"
     except Exception as e:
-        error_msg = f"数据库连接失败: {str(e)}"
+        error_msg = f"Database connection failed: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         return error_msg
 
 @mcp.tool()
 async def disconnect_database() -> str:
-    """断开与数据库的连接。
+    """Disconnect from the database.
     
     Returns:
-        断开连接的结果
+        Result of disconnection
     """
     global db_connection
     
-    logger.info("断开数据库连接")
+    logger.info("Disconnecting database connection")
     
-    # 关闭数据库连接
+    # Close database connection
     if db_connection:
         try:
             db_connection.close()
             db_connection = None
-            logger.info("数据库连接已关闭")
-            return "数据库连接已关闭"
+            logger.info("Database connection closed")
+            return "Database connection closed"
         except Exception as e:
-            error_msg = f"关闭数据库连接时出错: {str(e)}"
+            error_msg = f"Error closing database connection: {str(e)}"
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             return error_msg
     else:
-        return "当前没有活跃的数据库连接"
+        return "No active database connection currently"
 
 @mcp.tool()
 async def get_tables() -> Dict[str, List[Dict[str, str]]]:
-    """获取数据库中的所有表。
+    """Get all tables from the database.
     
     Returns:
-        包含表信息的字典
+        Dictionary containing table information
     """
     global db_connection, last_connect_params
     if not db_connection:
         try:
             if last_connect_params:
-                logger.info("尝试重新连接数据库")
+                logger.info("Attempting to reconnect to database")
                 db_connection = psycopg2.connect(**last_connect_params)
                 db_connection.set_session(autocommit=True)
             else:
-                error_msg = "未连接到数据库"
+                error_msg = "Not connected to database"
                 logger.error(error_msg)
                 return {"error": error_msg}
         except Exception as e:
-            error_msg = f"重新连接数据库失败: {str(e)}"
+            error_msg = f"Failed to reconnect to database: {str(e)}"
             logger.error(error_msg)
             return {"error": error_msg}
 
     try:
         with db_connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
-            # 获取所有表
+            # Get all tables
             cursor.execute("""
                 SELECT 
                     table_schema,
@@ -226,7 +242,7 @@ async def get_tables() -> Dict[str, List[Dict[str, str]]]:
             """)
             tables = cursor.fetchall()
             
-            # 获取每个表的列信息
+            # Get column information for each table
             result = []
             for table in tables:
                 cursor.execute("""
@@ -256,52 +272,52 @@ async def get_tables() -> Dict[str, List[Dict[str, str]]]:
             
             return {"tables": result}
     except Exception as e:
-        error_msg = f"获取表信息失败: {str(e)}"
+        error_msg = f"Failed to get table information: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         
-        # 如果是连接错误，尝试重新连接
+        # If it's a connection error, try to reconnect
         if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
             try:
                 if last_connect_params:
-                    logger.info("尝试重新连接数据库")
+                    logger.info("Attempting to reconnect to database")
                     db_connection = psycopg2.connect(**last_connect_params)
                     db_connection.set_session(autocommit=True)
                     return await get_tables()
             except Exception as reconnect_error:
-                logger.error(f"重新连接失败: {str(reconnect_error)}")
+                logger.error(f"Reconnection failed: {str(reconnect_error)}")
         
         return {"error": error_msg}
 
 @mcp.tool()
 async def get_table_schema(table_name: str) -> Dict[str, List[Dict[str, str]]]:
-    """获取指定表的结构信息。
+    """Get structure information of a specified table.
     
     Args:
-        table_name: 表名
+        table_name: Table name
         
     Returns:
-        包含表结构信息的字典
+        Dictionary containing table structure information
     """
     global db_connection, last_connect_params
     if not db_connection:
         try:
             if last_connect_params:
-                logger.info("尝试重新连接数据库")
+                logger.info("Attempting to reconnect to database")
                 db_connection = psycopg2.connect(**last_connect_params)
                 db_connection.set_session(autocommit=True)
             else:
-                error_msg = "未连接到数据库"
+                error_msg = "Not connected to database"
                 logger.error(error_msg)
                 return {"error": error_msg}
         except Exception as e:
-            error_msg = f"重新连接数据库失败: {str(e)}"
+            error_msg = f"Failed to reconnect to database: {str(e)}"
             logger.error(error_msg)
             return {"error": error_msg}
 
     try:
         with db_connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
-            # 获取表的列信息
+            # Get table column information
             cursor.execute("""
                 SELECT 
                     column_name,
@@ -319,9 +335,9 @@ async def get_table_schema(table_name: str) -> Dict[str, List[Dict[str, str]]]:
             columns = cursor.fetchall()
             
             if not columns:
-                return {"error": f"表 {table_name} 不存在"}
+                return {"error": f"Table {table_name} does not exist"}
             
-            # 获取表的索引信息
+            # Get table index information
             cursor.execute("""
                 SELECT 
                     i.relname as index_name,
@@ -350,46 +366,46 @@ async def get_table_schema(table_name: str) -> Dict[str, List[Dict[str, str]]]:
                 "indexes": indexes
             }
     except Exception as e:
-        error_msg = f"获取表结构失败: {str(e)}"
+        error_msg = f"Failed to get table structure: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         
-        # 如果是连接错误，尝试重新连接
+        # If it's a connection error, try to reconnect
         if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
             try:
                 if last_connect_params:
-                    logger.info("尝试重新连接数据库")
+                    logger.info("Attempting to reconnect to database")
                     db_connection = psycopg2.connect(**last_connect_params)
                     db_connection.set_session(autocommit=True)
                     return await get_table_schema(table_name)
             except Exception as reconnect_error:
-                logger.error(f"重新连接失败: {str(reconnect_error)}")
+                logger.error(f"Reconnection failed: {str(reconnect_error)}")
         
         return {"error": error_msg}
 
 @mcp.tool()
 async def execute_query(query: str) -> Dict[str, Any]:
-    """执行SQL查询。
+    """Execute SQL query.
     
     Args:
-        query: SQL查询语句
+        query: SQL query statement
         
     Returns:
-        查询结果或影响的行数
+        Query results or number of affected rows
     """
     global db_connection, last_connect_params
     if not db_connection:
         try:
             if last_connect_params:
-                logger.info("尝试重新连接数据库")
+                logger.info("Attempting to reconnect to database")
                 db_connection = psycopg2.connect(**last_connect_params)
                 db_connection.set_session(autocommit=True)
             else:
-                error_msg = "未连接到数据库"
+                error_msg = "Not connected to database"
                 logger.error(error_msg)
                 return {"error": error_msg}
         except Exception as e:
-            error_msg = f"重新连接数据库失败: {str(e)}"
+            error_msg = f"Failed to reconnect to database: {str(e)}"
             logger.error(error_msg)
             return {"error": error_msg}
 
@@ -397,127 +413,127 @@ async def execute_query(query: str) -> Dict[str, Any]:
         with db_connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             cursor.execute(query)
             
-            # 如果是SELECT查询，返回结果集
+            # If it's a SELECT query, return the result set
             if query.strip().upper().startswith("SELECT"):
                 results = cursor.fetchall()
                 return {"results": results}
-            # 否则返回受影响的行数
+            # Otherwise, return the number of affected rows
             else:
                 return {"affected_rows": cursor.rowcount}
     except Exception as e:
-        error_msg = f"执行查询失败: {str(e)}"
+        error_msg = f"Failed to execute query: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         
-        # 如果是连接错误，尝试重新连接
+        # If it's a connection error, try to reconnect
         if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
             try:
                 if last_connect_params:
-                    logger.info("尝试重新连接数据库")
+                    logger.info("Attempting to reconnect to database")
                     db_connection = psycopg2.connect(**last_connect_params)
                     db_connection.set_session(autocommit=True)
                     return await execute_query(query)
             except Exception as reconnect_error:
-                logger.error(f"重新连接失败: {str(reconnect_error)}")
+                logger.error(f"Reconnection failed: {str(reconnect_error)}")
         
         return {"error": error_msg}
 
 @mcp.resource("db://status")
 async def get_db_status() -> str:
-    """获取数据库连接状态"""
+    """Get database connection status"""
     global db_connection, last_connect_params
     if not db_connection:
-        logger.info("获取数据库状态: 未连接")
-        return "未连接"
+        logger.info("Getting database status: Not connected")
+        return "Not connected"
     
     try:
         with db_connection.cursor() as cursor:
             cursor.execute("SELECT version()")
             version = cursor.fetchone()[0]
-            status = f"已连接 - {version}"
-            logger.info(f"获取数据库状态: {status}")
+            status = f"Connected - {version}"
+            logger.info(f"Getting database status: {status}")
             return status
     except Exception as e:
-        status = f"连接错误 - {str(e)}"
-        logger.error(f"获取数据库状态失败: {status}")
+        status = f"Connection error - {str(e)}"
+        logger.error(f"Failed to get database status: {status}")
         logger.error(traceback.format_exc())
         
-        # 尝试重新连接
+        # Attempt to reconnect
         if last_connect_params:
             try:
-                logger.info("尝试重新连接数据库")
+                logger.info("Attempting to reconnect to database")
                 db_connection = psycopg2.connect(**last_connect_params)
                 db_connection.set_session(autocommit=True)
-                logger.info("数据库重新连接成功")
+                logger.info("Database reconnection successful")
                 
                 with db_connection.cursor() as cursor:
                     cursor.execute("SELECT version()")
                     version = cursor.fetchone()[0]
-                    status = f"已连接 - {version}"
-                    logger.info(f"获取数据库状态: {status}")
+                    status = f"Connected - {version}"
+                    logger.info(f"Getting database status: {status}")
                     return status
             except Exception as reconnect_error:
-                logger.error(f"数据库重新连接失败: {str(reconnect_error)}")
+                logger.error(f"Database reconnection failed: {str(reconnect_error)}")
         
         return status
 
 @mcp.prompt("sql_query_template")
 async def sql_query_template() -> str:
-    """SQL查询提示模板"""
-    logger.info("获取SQL查询提示模板")
+    """SQL query prompt template"""
+    logger.info("Getting SQL query prompt template")
     return """
-    -- 查询示例
+    -- Query example
     SELECT * FROM table_name WHERE condition;
     
-    -- 插入示例
+    -- Insert example
     INSERT INTO table_name (column1, column2) VALUES (value1, value2);
     
-    -- 更新示例
+    -- Update example
     UPDATE table_name SET column1 = value1 WHERE condition;
     
-    -- 删除示例
+    -- Delete example
     DELETE FROM table_name WHERE condition;
     """
 
-# 添加一个初始化连接的工具，用于替代@mcp.init
+# Add a tool to initialize connection, replacing @mcp.init
 @mcp.tool()
 async def initialize_connection(jdbc_url: str, username: str, password: str) -> str:
-    """初始化连接，当客户端连接时调用。
+    """Initialize connection, called when the client connects.
     
     Args:
-        jdbc_url: JDBC连接URL (例如: jdbc:postgresql://localhost:26257/defaultdb)
-        username: 数据库用户名
-        password: 数据库密码
+        jdbc_url: JDBC connection URL (e.g., jdbc:postgresql://localhost:26257/defaultdb)
+        username: Database username
+        password: Database password
         
     Returns:
-        初始化结果
+        Initialization result
     """
     global db_connection, last_connect_params
     try:
-        logger.info(f"尝试初始化数据库连接: {jdbc_url}")
+        logger.info(f"Attempting to initialize database connection: {jdbc_url}")
         
-        # 解析JDBC URL
+        # Parse JDBC URL
         host, port, database, query_params = parse_jdbc_url(jdbc_url)
         
-        # 如果已有连接，先关闭
+        # If connection exists, close it first
         if db_connection:
             try:
                 db_connection.close()
             except:
                 pass
         
-        # 创建新连接
+        # Create new connection
         db_connection, last_connect_params = create_connection(host, port, database, username, password, query_params)
         
-        # 测试连接
+        # Test connection
         with db_connection.cursor() as cursor:
             cursor.execute("SELECT 1")
             cursor.fetchone()
         
-        logger.info("数据库连接初始化成功")
-        return "数据库连接初始化成功"
+        logger.info("Database connection initialized successfully")
+        return "Database connection initialized successfully"
     except Exception as e:
-        error_msg = f"数据库连接初始化失败: {str(e)}"
+        error_msg = f"Database connection initialization failed: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         return error_msg
@@ -525,7 +541,7 @@ async def initialize_connection(jdbc_url: str, username: str, password: str) -> 
 if __name__ == "__main__":
     logger.info("Starting CockroachDB MCP server...")
     try:
-        # 运行服务器
+        # Run the server
         mcp.run(transport='stdio')
         logger.info("Server started successfully")
     except Exception as e:
