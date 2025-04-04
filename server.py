@@ -8,6 +8,7 @@ import psycopg2.extras
 import traceback
 import signal
 from typing import Dict, List, Any
+from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 
 # Create logs directory (if it doesn't exist)
@@ -65,45 +66,29 @@ mcp = FastMCP(
 )
 
 def parse_jdbc_url(jdbc_url):
-    """Parse JDBC URL and return connection parameters"""
-    # Format: jdbc:postgresql://username:password@host:port/database?param1=value1&param2=value2
-    # Or: postgresql://username:password@host:port/database?param1=value1&param2=value2
-    jdbc_url = jdbc_url.replace("jdbc:", "")
-    
-    # Separate query parameters
-    url_parts = jdbc_url.split("?")
-    base_url = url_parts[0]
+    """Parse JDBC URL and return connection parameters using urllib"""
+    # Remove "jdbc:" prefix if present
+    if jdbc_url.startswith("jdbc:"):
+        jdbc_url = jdbc_url[5:]
+
+    parsed = urlparse(jdbc_url)
+
+    # Extract components
+    host = parsed.hostname
+    port = parsed.port if parsed.port else 26257  # Default CockroachDB port
+    database = parsed.path.lstrip('/') if parsed.path else "defaultdb" # Remove leading slash
+
+    # Extract query parameters
     query_params = {}
-    if len(url_parts) > 1:
-        query_string = url_parts[1]
-        for param in query_string.split("&"):
+    if parsed.query:
+        for param in parsed.query.split("&"):
             if "=" in param:
                 key, value = param.split("=", 1)
                 query_params[key] = value
-    
-    # Parse base URL part
-    base_url = base_url.replace("postgresql://", "")
-    
-    # Handle potential authentication information
-    if "@" in base_url:
-        # Separate authentication info and host info
-        auth_host = base_url.split("@", 1)
-        host_port_db = auth_host[1].split("/")
-    else:
-        host_port_db = base_url.split("/")
-    
-    # Parse host and port
-    if ":" in host_port_db[0]:
-        host_port = host_port_db[0].split(":")
-        host = host_port[0]
-        port = int(host_port[1]) if len(host_port) > 1 else 26257
-    else:
-        host = host_port_db[0]
-        port = 26257
-    
-    # Parse database name
-    database = host_port_db[1] if len(host_port_db) > 1 else "defaultdb"
-    
+
+    # Note: username and password are handled separately by the connect_database function
+    # This parser focuses on host, port, database, and query params from the URL itself.
+
     return host, port, database, query_params
 
 def create_connection(host, port, database, username, password, query_params):
@@ -155,9 +140,12 @@ async def connect_database(jdbc_url: str, username: str, password: str) -> str:
         if db_connection:
             try:
                 db_connection.close()
-            except:
+                # logger.info("Closed existing database connection.")
+            except Exception as close_exc:
                 pass
-        
+                # logger.warning(f"Error closing existing database connection: {close_exc}")
+                # Continue even if closing failed
+
         # Create new connection
         db_connection, last_connect_params = create_connection(host, port, database, username, password, query_params)
         
@@ -200,6 +188,34 @@ async def disconnect_database() -> str:
     else:
         return "No active database connection currently"
 
+def _ensure_connection():
+    """Checks for an active DB connection and attempts reconnection if necessary."""
+    global db_connection, last_connect_params
+    if db_connection:
+        # Check if the connection is still alive
+        try:
+            with db_connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            return # Connection is good
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # logger.warning(f"Connection check failed: {e}. Attempting reconnect.")
+            db_connection = None # Force reconnect attempt below
+
+    if not db_connection:
+        if last_connect_params:
+            # logger.info("No active connection or connection lost. Attempting to reconnect...")
+            try:
+                db_connection = psycopg2.connect(**last_connect_params)
+                db_connection.set_session(autocommit=True)
+                # logger.info("Database reconnection successful.")
+            except Exception as e:
+                logger.error(f"Failed to reconnect to database: {str(e)}")
+                db_connection = None # Ensure connection is None if reconnect fails
+                raise ConnectionError(f"Failed to reconnect to database: {str(e)}") # Raise specific error
+        else:
+            logger.error("Not connected to database and no previous connection parameters found.")
+            raise ConnectionError("Not connected to database and no previous connection parameters found.")
+
 @mcp.tool()
 async def get_tables() -> Dict[str, List[Dict[str, str]]]:
     """Get all tables from the database.
@@ -207,23 +223,11 @@ async def get_tables() -> Dict[str, List[Dict[str, str]]]:
     Returns:
         Dictionary containing table information
     """
-    global db_connection, last_connect_params
-    if not db_connection:
-        try:
-            if last_connect_params:
-                logger.info("Attempting to reconnect to database")
-                db_connection = psycopg2.connect(**last_connect_params)
-                db_connection.set_session(autocommit=True)
-            else:
-                error_msg = "Not connected to database"
-                logger.error(error_msg)
-                return {"error": error_msg}
-        except Exception as e:
-            error_msg = f"Failed to reconnect to database: {str(e)}"
-            logger.error(error_msg)
-            return {"error": error_msg}
+    global db_connection # last_connect_params is handled by _ensure_connection
 
     try:
+        _ensure_connection() # Ensure connection is active
+
         with db_connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             # Get all tables
             cursor.execute("""
@@ -276,17 +280,13 @@ async def get_tables() -> Dict[str, List[Dict[str, str]]]:
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         
-        # If it's a connection error, try to reconnect
+        # If a connection error occurs *during* the query, log it but don't retry here.
+        # _ensure_connection handles the initial check/reconnect attempt.
         if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
-            try:
-                if last_connect_params:
-                    logger.info("Attempting to reconnect to database")
-                    db_connection = psycopg2.connect(**last_connect_params)
-                    db_connection.set_session(autocommit=True)
-                    return await get_tables()
-            except Exception as reconnect_error:
-                logger.error(f"Reconnection failed: {str(reconnect_error)}")
-        
+             logger.error("Connection error occurred during query execution.")
+             # Optionally reset db_connection to None to force reconnect on next call
+             # db_connection = None
+
         return {"error": error_msg}
 
 @mcp.tool()
@@ -299,43 +299,40 @@ async def get_table_schema(table_name: str) -> Dict[str, List[Dict[str, str]]]:
     Returns:
         Dictionary containing table structure information
     """
-    global db_connection, last_connect_params
-    if not db_connection:
-        try:
-            if last_connect_params:
-                logger.info("Attempting to reconnect to database")
-                db_connection = psycopg2.connect(**last_connect_params)
-                db_connection.set_session(autocommit=True)
-            else:
-                error_msg = "Not connected to database"
-                logger.error(error_msg)
-                return {"error": error_msg}
-        except Exception as e:
-            error_msg = f"Failed to reconnect to database: {str(e)}"
-            logger.error(error_msg)
-            return {"error": error_msg}
+    global db_connection # last_connect_params is handled by _ensure_connection
 
     try:
+        _ensure_connection() # Ensure connection is active
+
         with db_connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            # Parse table_name for schema.table format
+            if '.' in table_name:
+                schema_name, table_name_only = table_name.split('.', 1)
+            else:
+                schema_name = 'public' # Default to public schema if not specified
+                table_name_only = table_name
+
+            logger.info(f"Getting schema for table: {table_name_only} in schema: {schema_name}")
+
             # Get table column information
             cursor.execute("""
-                SELECT 
+                SELECT
                     column_name,
                     data_type,
                     character_maximum_length,
                     column_default,
                     is_nullable
-                FROM 
+                FROM
                     information_schema.columns
-                WHERE 
-                    table_name = %s
-                ORDER BY 
+                WHERE
+                    table_schema = %s AND table_name = %s
+                ORDER BY
                     ordinal_position
-            """, (table_name,))
+            """, (schema_name, table_name_only))
             columns = cursor.fetchall()
             
             if not columns:
-                return {"error": f"Table {table_name} does not exist"}
+                return {"error": f"Table '{table_name_only}' in schema '{schema_name}' does not exist or no columns found."}
             
             # Get table index information
             cursor.execute("""
@@ -356,9 +353,20 @@ async def get_table_schema(table_name: str) -> Dict[str, List[Dict[str, str]]]:
                     AND a.attnum = ANY(ix.indkey)
                     AND t.relkind = 'r'
                     AND t.relname = %s
-                ORDER BY 
+                    AND n.nspname = %s -- Filter by schema name
+                FROM
+                    pg_class t
+                    JOIN pg_index ix ON t.oid = ix.indrelid
+                    JOIN pg_class i ON i.oid = ix.indexrelid
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+                    JOIN pg_namespace n ON t.relnamespace = n.oid -- Join with namespace for schema name
+                WHERE
+                    t.relkind = 'r'
+                    AND t.relname = %s -- table name
+                    AND n.nspname = %s -- schema name
+                ORDER BY
                     i.relname
-            """, (table_name,))
+            """, (table_name_only, schema_name))
             indexes = cursor.fetchall()
             
             return {
@@ -370,17 +378,11 @@ async def get_table_schema(table_name: str) -> Dict[str, List[Dict[str, str]]]:
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         
-        # If it's a connection error, try to reconnect
+        # If a connection error occurs *during* the query, log it but don't retry here.
         if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
-            try:
-                if last_connect_params:
-                    logger.info("Attempting to reconnect to database")
-                    db_connection = psycopg2.connect(**last_connect_params)
-                    db_connection.set_session(autocommit=True)
-                    return await get_table_schema(table_name)
-            except Exception as reconnect_error:
-                logger.error(f"Reconnection failed: {str(reconnect_error)}")
-        
+             logger.error("Connection error occurred during query execution.")
+             # db_connection = None # Optionally reset
+
         return {"error": error_msg}
 
 @mcp.tool()
@@ -393,23 +395,11 @@ async def execute_query(query: str) -> Dict[str, Any]:
     Returns:
         Query results or number of affected rows
     """
-    global db_connection, last_connect_params
-    if not db_connection:
-        try:
-            if last_connect_params:
-                logger.info("Attempting to reconnect to database")
-                db_connection = psycopg2.connect(**last_connect_params)
-                db_connection.set_session(autocommit=True)
-            else:
-                error_msg = "Not connected to database"
-                logger.error(error_msg)
-                return {"error": error_msg}
-        except Exception as e:
-            error_msg = f"Failed to reconnect to database: {str(e)}"
-            logger.error(error_msg)
-            return {"error": error_msg}
+    global db_connection # last_connect_params is handled by _ensure_connection
 
     try:
+        _ensure_connection() # Ensure connection is active
+
         with db_connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             cursor.execute(query)
             
@@ -425,28 +415,19 @@ async def execute_query(query: str) -> Dict[str, Any]:
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         
-        # If it's a connection error, try to reconnect
+        # If a connection error occurs *during* the query, log it but don't retry here.
         if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
-            try:
-                if last_connect_params:
-                    logger.info("Attempting to reconnect to database")
-                    db_connection = psycopg2.connect(**last_connect_params)
-                    db_connection.set_session(autocommit=True)
-                    return await execute_query(query)
-            except Exception as reconnect_error:
-                logger.error(f"Reconnection failed: {str(reconnect_error)}")
-        
+             logger.error("Connection error occurred during query execution.")
+             # db_connection = None # Optionally reset
+
         return {"error": error_msg}
 
 @mcp.resource("db://status")
 async def get_db_status() -> str:
     """Get database connection status"""
-    global db_connection, last_connect_params
-    if not db_connection:
-        logger.info("Getting database status: Not connected")
-        return "Not connected"
-    
+    global db_connection # last_connect_params is handled by _ensure_connection
     try:
+        _ensure_connection() # Ensure connection is active
         with db_connection.cursor() as cursor:
             cursor.execute("SELECT version()")
             version = cursor.fetchone()[0]
@@ -457,24 +438,23 @@ async def get_db_status() -> str:
         status = f"Connection error - {str(e)}"
         logger.error(f"Failed to get database status: {status}")
         logger.error(traceback.format_exc())
-        
-        # Attempt to reconnect
-        if last_connect_params:
-            try:
-                logger.info("Attempting to reconnect to database")
-                db_connection = psycopg2.connect(**last_connect_params)
-                db_connection.set_session(autocommit=True)
-                logger.info("Database reconnection successful")
-                
-                with db_connection.cursor() as cursor:
-                    cursor.execute("SELECT version()")
-                    version = cursor.fetchone()[0]
-                    status = f"Connected - {version}"
-                    logger.info(f"Getting database status: {status}")
-                    return status
-            except Exception as reconnect_error:
-                logger.error(f"Database reconnection failed: {str(reconnect_error)}")
-        
+        # If the error is a DB connection issue after _ensure_connection passed,
+        # it might indicate the connection dropped again. Resetting might be wise.
+        if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            db_connection = None # Reset connection state
+        return status
+    except ConnectionError as ce: # Catch specific error from _ensure_connection
+        status = f"Connection error - {str(ce)}"
+        logger.error(f"Failed to get database status: {status}")
+        return status
+    except Exception as e: # Catch other errors during SELECT version()
+        status = f"Error checking status - {str(e)}"
+        logger.error(f"Failed to get database status: {status}")
+        logger.error(traceback.format_exc())
+        # If the error is a DB connection issue after _ensure_connection passed,
+        # it might indicate the connection dropped again. Resetting might be wise.
+        if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            db_connection = None
         return status
 
 @mcp.prompt("sql_query_template")
@@ -495,48 +475,7 @@ async def sql_query_template() -> str:
     DELETE FROM table_name WHERE condition;
     """
 
-# Add a tool to initialize connection, replacing @mcp.init
-@mcp.tool()
-async def initialize_connection(jdbc_url: str, username: str, password: str) -> str:
-    """Initialize connection, called when the client connects.
-    
-    Args:
-        jdbc_url: JDBC connection URL (e.g., jdbc:postgresql://localhost:26257/defaultdb)
-        username: Database username
-        password: Database password
-        
-    Returns:
-        Initialization result
-    """
-    global db_connection, last_connect_params
-    try:
-        logger.info(f"Attempting to initialize database connection: {jdbc_url}")
-        
-        # Parse JDBC URL
-        host, port, database, query_params = parse_jdbc_url(jdbc_url)
-        
-        # If connection exists, close it first
-        if db_connection:
-            try:
-                db_connection.close()
-            except:
-                pass
-        
-        # Create new connection
-        db_connection, last_connect_params = create_connection(host, port, database, username, password, query_params)
-        
-        # Test connection
-        with db_connection.cursor() as cursor:
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
-        
-        logger.info("Database connection initialized successfully")
-        return "Database connection initialized successfully"
-    except Exception as e:
-        error_msg = f"Database connection initialization failed: {str(e)}"
-        logger.error(error_msg)
-        logger.error(traceback.format_exc())
-        return error_msg
+# Removed redundant initialize_connection tool. Use connect_database instead.
 
 if __name__ == "__main__":
     logger.info("Starting CockroachDB MCP server...")
